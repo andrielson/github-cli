@@ -1,0 +1,14 @@
+{
+  "name": "github-cli",
+  "version": "0.0.1",
+  "private": true,
+  "packageManager": "bun",
+  "scripts": {
+    "prepare": "husky"
+  },
+  "devDependencies": {
+    "husky": "^9.1.7",
+    "lint-staged": "^17.5.0",
+    "prettier": "^3.9.6"
+  }
+}

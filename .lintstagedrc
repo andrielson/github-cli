@@ -1,0 +1,4 @@
+{
+  "*": "prettier --ignore-unknown --write",
+  "ignore": [".agents/**", ".claude/**", "skills-lock.json"]
+}
