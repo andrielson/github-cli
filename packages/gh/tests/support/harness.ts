@@ -509,9 +509,13 @@ function packArchive(
   sourceRoot: string,
   archivePath: string
 ): void {
+  // Under git-bash on Windows, GNU tar parses the drive letter of an absolute
+  // path as a remote-host spec; --force-local keeps it local (bsdtar accepts
+  // it too, so the sandbox's System32 tar is unaffected either way).
+  const forceLocal = process.platform === "win32" ? ["--force-local"] : [];
   const result = spawnSync(
     "tar",
-    ["-a", "-cf", archivePath, "-C", workDir, sourceRoot],
+    ["-a", ...forceLocal, "-cf", archivePath, "-C", workDir, sourceRoot],
     { encoding: "utf8" }
   );
   if (result.status !== 0) {
