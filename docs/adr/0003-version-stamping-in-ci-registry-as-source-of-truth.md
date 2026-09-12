@@ -1,5 +1,7 @@
 # Version stamping in CI; the registry is the source of truth
 
+Status: superseded by ADR 0004 (2026-09-12, wayfinder #6). Recorded here as originally decided in the release-automation ticket (2026-09-09).
+
 The repo never carries a real package version: `package.json` on `main` stays pinned at `0.0.0-dev`, and the publish workflow stamps the actual version into `src/version.ts` and `package.json` in an ephemeral checkout right before `npm publish`. The npm registry — not git history — is the single source of truth for which versions exist.
 
 ## Considered Options
