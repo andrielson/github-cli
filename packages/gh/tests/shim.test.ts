@@ -4,6 +4,7 @@ import {
   beforeEach,
   describe,
   expect,
+  setDefaultTimeout,
   test,
 } from "bun:test";
 import { existsSync, writeFileSync } from "node:fs";
@@ -17,6 +18,14 @@ import {
   type SpawnResult,
   type StubProxy,
 } from "./support/harness";
+
+/**
+ * Every test here packs, downloads, verifies and extracts a real archive and
+ * spawns real processes; on Windows the fixtures additionally carry compiled
+ * standalone stub executables (~80 MB each), so multi-second tests are the
+ * healthy case there — the default 5 s ceiling would cut healthy runs down.
+ */
+setDefaultTimeout(60_000);
 
 /** The stub's report line: what the real binary received at the boundary. */
 function reportOf(result: SpawnResult): { args: string[]; stdin: string } {
