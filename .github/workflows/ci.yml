@@ -34,17 +34,20 @@ jobs:
         # macos-26-intel is EOL around Fall 2027; the documented fallback then
         # is running the darwin/amd64 cell on the arm64 macOS runner under
         # Rosetta. Drop the intel cell when GitHub retires the label.
+        #
+        # `expect` uses Node's process.platform/process.arch spelling — x64 is
+        # the amd64 asset cell; the suite maps to the upstream asset name.
         include:
           - runner: ubuntu-24.04
-            expect: linux/amd64
+            expect: linux/x64
           - runner: ubuntu-24.04-arm
             expect: linux/arm64
           - runner: macos-26-intel
-            expect: darwin/amd64
+            expect: darwin/x64
           - runner: macos-26
             expect: darwin/arm64
           - runner: windows-2025
-            expect: win32/amd64
+            expect: win32/x64
           - runner: windows-11-arm
             expect: win32/arm64
     steps:
@@ -68,9 +71,10 @@ jobs:
     steps:
       # git and node are needed before checkout: JavaScript actions run inside
       # the container, and the suite's stub binaries carry node shebangs. GNU
-      # tar because busybox tar has no -a for the fixture archives.
+      # tar because busybox tar has no -a for the fixture archives, and curl
+      # for the shim's curl-fallback download route the suite exercises.
       - name: Install container tools
-        run: apk add --no-cache git nodejs tar
+        run: apk add --no-cache git nodejs tar curl
       - uses: actions/checkout@v7
       - run: bun install --frozen-lockfile
       - run: bun test

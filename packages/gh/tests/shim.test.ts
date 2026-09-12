@@ -340,6 +340,22 @@ describe("proxy support on the download path, at the process boundary (seam 1)",
     proxies.length = 0;
   });
 
+  /**
+   * The upstream authority each proxied download was sent to: the runtime's
+   * proxy dispatcher chooses the wire form — newer Node sends absolute-form
+   * requests (the full URL as the request target), Node 22 CONNECT-tunnels
+   * (the authority only). Either form is the wrapper keeping its promise
+   * that the download travelled through the proxy; what travelled is proven
+   * mirror-side.
+   */
+  function proxiedAuthorities(proxy: StubProxy): string[] {
+    return proxy.requests.map((request) =>
+      request.target.includes("://")
+        ? new URL(request.target).host
+        : request.target
+    );
+  }
+
   /** Serve a release and point a stub proxy at the mirror, in one step. */
   async function serveReleaseBehindProxy(
     stub: { exitCode?: number; stderr?: string } = {}
@@ -389,10 +405,11 @@ describe("proxy support on the download path, at the process boundary (seam 1)",
       "value with spaces",
     ]);
     expect(existsSync(cacheBinaryPath)).toBe(true);
-    // Both files travelled through the proxy (absolute targets), and the
-    // proxy actually forwarded them — the mirror saw both too.
-    expect(proxy.requests.map((request) => request.target).sort()).toEqual(
-      [assetUrl, checksumsUrl].sort()
+    // Both files travelled through the proxy — absolute-form requests or
+    // CONNECT tunnels, whichever wire form the runtime's dispatcher chose —
+    // and the proxy actually forwarded them: the mirror saw both too.
+    expect(proxiedAuthorities(proxy).sort()).toEqual(
+      [new URL(assetUrl).host, new URL(checksumsUrl).host].sort()
     );
     expect(
       harness.mirror.requests.map((request) => request.path).sort()
@@ -465,15 +482,24 @@ describe("proxy support on the download path, at the process boundary (seam 1)",
   });
 
   test("npm's proxy configuration in ~/.npmrc routes downloads through the proxy", async () => {
-    const { proxy, assetUrl, checksumsUrl, cacheBinaryPath } =
-      await serveReleaseBehindProxy();
+    const {
+      proxy,
+      assetUrl,
+      checksumsUrl,
+      assetPath,
+      checksumsPath,
+      cacheBinaryPath,
+    } = await serveReleaseBehindProxy();
     writeFileSync(join(harness.sandbox.home, ".npmrc"), `proxy=${proxy.url}\n`);
     const result = await harness.spawnShim(["--version"]);
 
     expect(result.exitCode).toBe(0);
-    expect(proxy.requests.map((request) => request.target).sort()).toEqual(
-      [assetUrl, checksumsUrl].sort()
+    expect(proxiedAuthorities(proxy).sort()).toEqual(
+      [new URL(assetUrl).host, new URL(checksumsUrl).host].sort()
     );
+    expect(
+      harness.mirror.requests.map((request) => request.path).sort()
+    ).toEqual([assetPath, checksumsPath].sort());
     expect(existsSync(cacheBinaryPath)).toBe(true);
   });
 

@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   chmodSync,
+  copyFileSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -296,15 +297,18 @@ export type StubGhOptions = {
 };
 
 /**
- * Write an executable stub `gh` binary at an exact path. The stub reports what
- * the shim handed it on stdout (one JSON line: `{ args, stdin }`), an optional
- * marker on stderr, and exits with the configured code — enough to verify
- * argument, stdio and exit-code passthrough at the outermost boundary.
+ * The stub's source: it reports what the shim handed it on stdout (one JSON
+ * line: `{ args, stdin }`), an optional marker on stderr, and exits with the
+ * configured code — enough to verify argument, stdio and exit-code passthrough
+ * at the outermost boundary. The same source runs as a script (node via the
+ * shebang) and as a compiled standalone executable: a compiled bun program
+ * keeps a virtual script slot at `process.argv[1]`, so the caller's arguments
+ * live at `process.argv.slice(2)` either way.
  */
-function writeStubScript(path: string, options: StubGhOptions): string {
+function stubSource(options: StubGhOptions): string {
   const exitCode = options.exitCode ?? 0;
   const stderrMarker = options.stderr ?? "";
-  const script = [
+  return [
     "#!/usr/bin/env node",
     '"use strict";',
     "",
@@ -328,8 +332,47 @@ function writeStubScript(path: string, options: StubGhOptions): string {
     'process.stdin.on("error", finish);',
     "",
   ].join("\n");
-  writeFileSync(path, script);
-  chmodSync(path, 0o755);
+}
+
+/** Compiled stub executables, keyed by stub behavior; win32 only. */
+const compiledStubs = new Map<string, string>();
+let compiledStubDir: string | undefined;
+
+/**
+ * Write an executable stub `gh` binary at an exact path. On POSIX this is the
+ * shebang script — the honest production shape, since the real binary is
+ * spawned directly. On win32 a script file is not spawnable at all (CreateProcess
+ * needs a PE executable), so the same source is compiled into a standalone
+ * executable with the suite's own bun toolchain. Compiles are cached per stub
+ * behavior: each embeds the ~80 MB runtime, and most tests reuse the default
+ * stub.
+ */
+function writeStubExecutable(path: string, options: StubGhOptions): string {
+  if (process.platform !== "win32") {
+    writeFileSync(path, stubSource(options));
+    chmodSync(path, 0o755);
+    return path;
+  }
+  const key = `${options.exitCode ?? 0}\u0000${options.stderr ?? ""}`;
+  let compiled = compiledStubs.get(key);
+  if (compiled === undefined) {
+    compiledStubDir ??= mkdtempSync(join(tmpdir(), "gh-wrapper-stub-"));
+    const source = join(compiledStubDir, `stub-${compiledStubs.size}.js`);
+    compiled = join(compiledStubDir, `stub-${compiledStubs.size}.exe`);
+    writeFileSync(source, stubSource(options));
+    const result = spawnSync(
+      process.execPath,
+      ["build", "--compile", source, "--outfile", compiled],
+      { encoding: "utf8" }
+    );
+    if (result.status !== 0) {
+      throw new Error(
+        `compiling the stub ${path} failed (exit ${result.status}):\n${result.stdout}${result.stderr}`
+      );
+    }
+    compiledStubs.set(key, compiled);
+  }
+  copyFileSync(compiled, path);
   return path;
 }
 
@@ -339,7 +382,11 @@ function writeStubGh(
   serial: number,
   options: StubGhOptions
 ): string {
-  return writeStubScript(join(dir, `stub-gh-${serial}.js`), options);
+  const extension = process.platform === "win32" ? ".exe" : ".js";
+  return writeStubExecutable(
+    join(dir, `stub-gh-${serial}${extension}`),
+    options
+  );
 }
 
 export type PlatformTarget = {
@@ -501,7 +548,7 @@ export async function createHarness(
     const work = mkdtempSync(join(sandbox.root, "release-fixture-"));
     const payload = join(work, "payload");
     mkdirSync(join(payload, archiveRoot, "bin"), { recursive: true });
-    writeStubScript(
+    writeStubExecutable(
       join(payload, archiveRoot, "bin", binaryName),
       fixtureOptions.stub ?? {}
     );
@@ -534,7 +581,15 @@ export async function createHarness(
     args: string[],
     spawnOptions: SpawnShimOptions = {}
   ): Promise<SpawnResult> => {
-    const proc = Bun.spawn([shimEntryPath, ...args], {
+    // On win32 a script file is not spawnable (CreateProcess needs a PE
+    // executable), and the production boundary there is npm's bin shim
+    // invoking the entry with node — the harness does the same. POSIX spawns
+    // the shebang entry directly, exactly as a shell would.
+    const command =
+      process.platform === "win32"
+        ? ["node", shimEntryPath, ...args]
+        : [shimEntryPath, ...args];
+    const proc = Bun.spawn(command, {
       env: { ...sandbox.env, ...spawnOptions.env },
       stdin: spawnOptions.input === undefined ? "ignore" : "pipe",
       stdout: "pipe",
