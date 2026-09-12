@@ -1,9 +1,11 @@
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   chmodSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
+  readFileSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -11,9 +13,13 @@ import {
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, relative, sep } from "node:path";
+import pkg from "../../package.json";
 
 const packageRoot = join(import.meta.dir, "..", "..");
 const repoRoot = join(packageRoot, "..", "..");
+
+/** The wrapper's own version — the one every fixture release must carry. */
+export const wrapperVersion: string = pkg.version;
 
 /** The shim's thin executable entry — what `bin.gh` in the manifest points at. */
 export const shimEntryPath = join(packageRoot, "bin", "gh.js");
@@ -194,19 +200,14 @@ export type StubGhOptions = {
 };
 
 /**
- * Write an executable stub `gh` binary into `dir`. The stub reports what the
- * shim handed it on stdout (one JSON line: `{ args, stdin }`), an optional
+ * Write an executable stub `gh` binary at an exact path. The stub reports what
+ * the shim handed it on stdout (one JSON line: `{ args, stdin }`), an optional
  * marker on stderr, and exits with the configured code — enough to verify
  * argument, stdio and exit-code passthrough at the outermost boundary.
  */
-function writeStubGh(
-  dir: string,
-  serial: number,
-  options: StubGhOptions
-): string {
+function writeStubScript(path: string, options: StubGhOptions): string {
   const exitCode = options.exitCode ?? 0;
   const stderrMarker = options.stderr ?? "";
-  const path = join(dir, `stub-gh-${serial}.js`);
   const script = [
     "#!/usr/bin/env node",
     '"use strict";',
@@ -236,6 +237,92 @@ function writeStubGh(
   return path;
 }
 
+/** Write a stub `gh` binary into `dir`; returns its path. */
+function writeStubGh(
+  dir: string,
+  serial: number,
+  options: StubGhOptions
+): string {
+  return writeStubScript(join(dir, `stub-gh-${serial}.js`), options);
+}
+
+export type PlatformTarget = {
+  /** The upstream asset name for the current platform and version. */
+  assetName: string;
+  /** The binary file name inside the archive and the cache: gh or gh.exe. */
+  binaryName: string;
+};
+
+/**
+ * The upstream asset rules for the runner's real platform: mixed-case macOS,
+ * lowercase linux/windows, `.tar.gz` on linux and `.zip` on macOS and Windows.
+ * Built from the upstream naming rules directly, not from the shim, so a
+ * mapping regression cannot self-confirm.
+ */
+export function currentPlatformAsset(version: string): PlatformTarget {
+  if (
+    !["linux", "darwin", "win32"].includes(process.platform) ||
+    !["x64", "arm64"].includes(process.arch)
+  ) {
+    throw new Error(
+      `the fixture builder has no asset rules for ${process.platform}/${process.arch}`
+    );
+  }
+  const assetOs =
+    process.platform === "darwin"
+      ? "macOS"
+      : process.platform === "linux"
+        ? "linux"
+        : "windows";
+  return {
+    assetName: `gh_${version}_${assetOs}_${
+      process.arch === "x64" ? "amd64" : "arm64"
+    }${process.platform === "linux" ? ".tar.gz" : ".zip"}`,
+    binaryName: process.platform === "win32" ? "gh.exe" : "gh",
+  };
+}
+
+/**
+ * Where the shim must cache the binary for the runner's real platform, per the
+ * OS-native shared-layout rules: `$XDG_CACHE_HOME` on linux, `~/Library/Caches`
+ * on macOS, `%LOCALAPPDATA%\\gh-wrapper\\Cache` on Windows.
+ */
+function cacheBinaryPathFor(
+  sandbox: Sandbox,
+  version: string,
+  binaryName: string
+): string {
+  const root =
+    process.platform === "win32"
+      ? join(sandbox.localAppData, "gh-wrapper", "Cache")
+      : process.platform === "darwin"
+        ? join(sandbox.home, "Library", "Caches", "gh-wrapper")
+        : join(sandbox.cacheHome, "gh-wrapper");
+  return join(root, version, "bin", binaryName);
+}
+
+export type ReleaseFixtureOptions = {
+  /** Behavior of the stub gh binary packed inside the archive. */
+  stub?: StubGhOptions;
+  /** Directory name at the archive root; defaults to the upstream-derived name. */
+  archiveRoot?: string;
+  /** Serve a checksum that does not match the archive bytes. */
+  tamperChecksum?: boolean;
+  /** Serve a checksums file with no entry for this platform's asset. */
+  omitChecksumEntry?: boolean;
+};
+
+export type ServedRelease = {
+  /** The asset name, e.g. `gh_2.100.0_linux_amd64.tar.gz`. */
+  assetName: string;
+  /** Mirror path the archive is served at. */
+  assetPath: string;
+  /** Mirror path the checksums file is served at. */
+  checksumsPath: string;
+  /** Where the shim is expected to cache the binary. */
+  cacheBinaryPath: string;
+};
+
 export type SpawnResult = {
   exitCode: number | null;
   stdout: string;
@@ -254,11 +341,46 @@ export type Harness = {
   mirror: Mirror;
   /** Write a stub `gh` binary into the sandbox; returns its path. */
   stubGh(options?: StubGhOptions): string;
+  /**
+   * Publish a release fixture on the mirror for the wrapper's own version: a
+   * real archive (system tar, upstream layout: `<root>/bin/gh`) holding the
+   * stub binary, plus the checksums file. Returns what was served and where
+   * the shim is expected to cache the binary.
+   */
+  serveRelease(options?: ReleaseFixtureOptions): ServedRelease;
   /** Spawn the built shim at the process boundary in the sandbox. */
   spawnShim(args: string[], options?: SpawnShimOptions): Promise<SpawnResult>;
   /** Remove the sandbox and stop the mirror. */
   cleanup(): Promise<void>;
 };
+
+/**
+ * Pack `sourceRoot` (a directory under `workDir`) into a real archive at
+ * `archivePath`, format chosen by extension through tar's auto-compress —
+ * `.tar.gz` under GNU tar on linux, `.zip` under bsdtar on macOS and Windows.
+ * tar's portable flags are short, so long-form-only style is not possible
+ * across all three tars.
+ */
+function packArchive(
+  workDir: string,
+  sourceRoot: string,
+  archivePath: string
+): void {
+  const result = spawnSync(
+    "tar",
+    ["-a", "-cf", archivePath, "-C", workDir, sourceRoot],
+    { encoding: "utf8" }
+  );
+  if (result.status !== 0) {
+    throw new Error(
+      `building the fixture archive failed (exit ${result.status}):\n${result.stdout}${result.stderr}`
+    );
+  }
+}
+
+function sha256(data: Buffer | string): string {
+  return createHash("sha256").update(data).digest("hex");
+}
 
 /**
  * The seam-1 harness: sandboxed spawn of the real shim, a fixture mirror the
@@ -273,6 +395,45 @@ export async function createHarness(
   const stubDir = join(sandbox.root, "stubs");
   mkdirSync(stubDir);
   let stubCount = 0;
+  const serveRelease = (
+    fixtureOptions: ReleaseFixtureOptions = {}
+  ): ServedRelease => {
+    const version = wrapperVersion;
+    const { assetName, binaryName } = currentPlatformAsset(version);
+    const archiveRoot =
+      fixtureOptions.archiveRoot ?? assetName.replace(/\.(tar\.gz|zip)$/, "");
+    const work = mkdtempSync(join(sandbox.root, "release-fixture-"));
+    const payload = join(work, "payload");
+    mkdirSync(join(payload, archiveRoot, "bin"), { recursive: true });
+    writeStubScript(
+      join(payload, archiveRoot, "bin", binaryName),
+      fixtureOptions.stub ?? {}
+    );
+    const archivePath = join(work, assetName);
+    packArchive(payload, archiveRoot, archivePath);
+
+    const checksumsName = `gh_${version}_checksums.txt`;
+    // Upstream shape: one `<sha256>  <asset>` line per asset, this platform's
+    // entry among others. The decoy line keeps the fixture honest about the
+    // shim having to pick its own entry out of the file.
+    const lines: string[] = [];
+    if (!fixtureOptions.omitChecksumEntry) {
+      const checksum = fixtureOptions.tamperChecksum
+        ? sha256(`not the archive: ${assetName}`)
+        : sha256(readFileSync(archivePath));
+      lines.push(`${checksum}  ${assetName}`);
+    }
+    const decoyAsset = assetName.replace(/_(amd64|arm64)\./, "_386.");
+    lines.push(`${sha256(`decoy: ${decoyAsset}`)}  ${decoyAsset}`);
+    mirror.serve(`/v${version}/${assetName}`, readFileSync(archivePath));
+    mirror.serve(`/v${version}/${checksumsName}`, `${lines.join("\n")}\n`);
+    return {
+      assetName,
+      assetPath: `/v${version}/${assetName}`,
+      checksumsPath: `/v${version}/${checksumsName}`,
+      cacheBinaryPath: cacheBinaryPathFor(sandbox, version, binaryName),
+    };
+  };
   const spawnShim = async (
     args: string[],
     spawnOptions: SpawnShimOptions = {}
@@ -297,6 +458,7 @@ export async function createHarness(
     mirror,
     stubGh: (stubOptions: StubGhOptions = {}) =>
       writeStubGh(stubDir, ++stubCount, stubOptions),
+    serveRelease,
     spawnShim,
     cleanup: async () => {
       rmSync(sandbox.root, { recursive: true, force: true });

@@ -21,6 +21,6 @@ The pre-commit hook runs Prettier over staged files and then the full test suite
 
 ## Tests
 
-The wrapper is tested at one black-box seam: the process boundary. The suite (`packages/gh/tests/`) spawns the real shim in a sandboxed temporary `HOME`/cache, points `GH_MIRROR` at a local fixture HTTP server (the download-source stand-in and the network canary), and dispatches to stub `gh` binaries via `GH_BINARY`. The shared machinery lives in `packages/gh/tests/support/harness.ts`.
+The wrapper is tested at one black-box seam: the process boundary. The suite (`packages/gh/tests/`) spawns the real shim in a sandboxed temporary `HOME`/cache, points `GH_MIRROR` at a local fixture HTTP server that serves release archives (real tar/zip files holding a stub `gh`) and checksums files, and dispatches to stub `gh` binaries via `GH_BINARY`. It covers the first-run lazy download end-to-end, cache-hit reruns (zero network), tampered-checksum aborts, extraction, race safety of cache population, and pass-through behavior. The shared machinery lives in `packages/gh/tests/support/harness.ts`.
 
 The release automation is tested at a second seam: its decision logic. `release/decision.test.ts` feeds the pure `decision.ts` module fixture GitHub-API and npm-registry data — including the committed backfill list — with no network anywhere.
