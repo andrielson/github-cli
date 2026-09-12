@@ -5,6 +5,7 @@ Home of `@andrielson/gh` — an npm package that delivers the official GitHub CL
 ## Repository layout
 
 - `packages/gh/` — the publishable wrapper package: manifest, thin `bin/gh.js` executable entry, `src/` shim source (bundled to a single file by bun), and the seam-1 test suite under `tests/`.
+- `release/` — release-automation decision logic: `decision.ts` is a pure module (fed by the backfill and poll workflows) computing the next missing version and the prerelease-flag vs tag-semver cross-check, with its seam-2 test suite.
 - `backfill/versions.txt` — the committed list of historical stable `gh` versions to backfill to npm.
 - `CONTEXT.md` — the domain glossary; `docs/adr/` — architecture decision records.
 
@@ -21,3 +22,5 @@ The pre-commit hook runs Prettier over staged files and then the full test suite
 ## Tests
 
 The wrapper is tested at one black-box seam: the process boundary. The suite (`packages/gh/tests/`) spawns the real shim in a sandboxed temporary `HOME`/cache, points `GH_MIRROR` at a local fixture HTTP server (the download-source stand-in and the network canary), and dispatches to stub `gh` binaries via `GH_BINARY`. The shared machinery lives in `packages/gh/tests/support/harness.ts`.
+
+The release automation is tested at a second seam: its decision logic. `release/decision.test.ts` feeds the pure `decision.ts` module fixture GitHub-API and npm-registry data — including the committed backfill list — with no network anywhere.
