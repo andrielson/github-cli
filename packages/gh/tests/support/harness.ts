@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import {
   chmodSync,
   copyFileSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -504,18 +505,34 @@ export type Harness = {
  * tar's portable flags are short, so long-form-only style is not possible
  * across all three tars.
  */
+/**
+ * The tar executable for fixture packing: on Windows the operating system's
+ * own bsdtar, resolved explicitly — run from a git-bash shell, a GNU tar
+ * earlier on PATH would neither honor `-a` for `.zip` (it writes a plain tar)
+ * nor stay compatible with what the shim extracts. Elsewhere, the PATH's tar.
+ */
+function fixtureTarCommand(): string {
+  if (process.platform === "win32") {
+    const systemTar = join(
+      process.env.SYSTEMROOT ?? "C:\\Windows",
+      "System32",
+      "tar.exe"
+    );
+    if (existsSync(systemTar)) {
+      return systemTar;
+    }
+  }
+  return "tar";
+}
+
 function packArchive(
   workDir: string,
   sourceRoot: string,
   archivePath: string
 ): void {
-  // Under git-bash on Windows, GNU tar parses the drive letter of an absolute
-  // path as a remote-host spec; --force-local keeps it local (bsdtar accepts
-  // it too, so the sandbox's System32 tar is unaffected either way).
-  const forceLocal = process.platform === "win32" ? ["--force-local"] : [];
   const result = spawnSync(
-    "tar",
-    ["-a", ...forceLocal, "-cf", archivePath, "-C", workDir, sourceRoot],
+    fixtureTarCommand(),
+    ["-a", "-cf", archivePath, "-C", workDir, sourceRoot],
     { encoding: "utf8" }
   );
   if (result.status !== 0) {

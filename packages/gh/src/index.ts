@@ -452,18 +452,32 @@ function expectedChecksum(
   return null;
 }
 
+/**
+ * The tar executable to invoke: on Windows, the operating system's own bsdtar,
+ * resolved explicitly — a tar earlier on PATH (GNU tar under git-bash) both
+ * misparses drive-letter paths as remote-host specs and cannot read the
+ * upstream `.zip` archives at all. Elsewhere, the system tar (GNU tar on
+ * linux, bsdtar on macOS), which reads both archive formats and auto-detects
+ * compression.
+ */
+function systemTarCommand(): string {
+  if (process.platform === "win32") {
+    const systemTar = join(
+      process.env.SYSTEMROOT ?? "C:\\Windows",
+      "System32",
+      "tar.exe"
+    );
+    if (existsSync(systemTar)) {
+      return systemTar;
+    }
+  }
+  return "tar";
+}
+
 function runTar(args: string[]): string {
-  // The system tar (GNU tar on linux, bsdtar on macOS and Windows) reads both
-  // archive formats and auto-detects compression. Its portable flags are the
-  // short ones, so long-form-only style is not possible across all three tars.
-  // On Windows, GNU tar — first on PATH under git-bash — parses the drive
-  // letter of an absolute path as a remote-host spec; --force-local (accepted
-  // by GNU tar and bsdtar alike, but not by busybox tar, hence win32 only)
-  // keeps every archive path local.
-  const forceLocal = process.platform === "win32" ? ["--force-local"] : [];
-  const result = spawnSync("tar", [...forceLocal, ...args], {
-    encoding: "utf8",
-  });
+  // The system tar's portable flags are the short ones, so long-form-only
+  // style is not possible across the tar flavors.
+  const result = spawnSync(systemTarCommand(), args, { encoding: "utf8" });
   if (result.error !== undefined) {
     throw new Error(`could not run the system tar: ${result.error.message}`);
   }
