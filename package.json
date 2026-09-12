@@ -4,7 +4,9 @@
   "private": true,
   "packageManager": "bun",
   "scripts": {
-    "prepare": "husky"
+    "prepare": "husky",
+    "build": "bun build packages/gh/src/index.ts --target=node --format=cjs --outfile=packages/gh/dist/shim.js",
+    "test": "bun test"
   },
   "devDependencies": {
     "husky": "^9.1.7",

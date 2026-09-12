@@ -1,0 +1,28 @@
+{
+  "name": "@andrielson/gh",
+  "version": "2.100.0",
+  "description": "Delivers the official GitHub CLI (gh) from npm: a drop-in gh command, zero runtime dependencies, zero code at install time.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Andrielson/github-cli.git"
+  },
+  "keywords": [
+    "github",
+    "cli",
+    "gh",
+    "wrapper"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "gh": "bin/gh.js"
+  },
+  "files": [
+    "bin/",
+    "dist/",
+    "LICENSE",
+    "README.md"
+  ]
+}

@@ -1,12 +1,12 @@
 # github-cli
 
-Greenfield repo (named for a planned GitHub CLI). No source code or tests exist yet — only vendored agent skills and JS tooling config. When build/test commands are established, record them here.
+Repo for `@andrielson/gh`, an npm wrapper delivering the official GitHub CLI. The wrapper package lives in `packages/gh/` (see its README); `CONTEXT.md` holds the domain glossary and `docs/adr/` the decision records.
 
 ## Tooling
 
 - Package manager is **bun**. Always use `bun` / `bunx`, never npm or npx.
-- Pre-commit hook (husky → lint-staged) runs Prettier on staged files. `.agents/**`, `.claude/**`, and `skills-lock.json` are deliberately excluded in `.lintstagedrc`: the lockfile pins each vendored skill's content hash, and reformatting those files breaks the pins.
-- No `test` or `typecheck` scripts exist yet — add them to `.husky/pre-commit` when they appear.
+- Pre-commit hook (husky → lint-staged) runs Prettier on staged files, then the full test suite (`bun test`). `.agents/**`, `.claude/**`, and `skills-lock.json` are deliberately excluded in `.lintstagedrc`: the lockfile pins each vendored skill's content hash, and reformatting those files breaks the pins.
+- Scripts: `bun run build` bundles the shim (`packages/gh/src/index.ts` → `packages/gh/dist/shim.js`, gitignored); `bun test` runs the suite (the suite rebuilds the bundle itself). No `typecheck` script exists yet — add it to `.husky/pre-commit` when it appears.
 
 ## Skills layout
 
