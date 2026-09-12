@@ -448,7 +448,11 @@ function cacheBinaryPathFor(
 export type ReleaseFixtureOptions = {
   /** Behavior of the stub gh binary packed inside the archive. */
   stub?: StubGhOptions;
-  /** Directory name at the archive root; defaults to the upstream-derived name. */
+  /**
+   * Directory name at the archive root; overrides the platform's real shape
+   * (versioned root on linux/macOS, flat on Windows) to prove the dynamic
+   * lookup.
+   */
   archiveRoot?: string;
   /** Serve a checksum that does not match the archive bytes. */
   tamperChecksum?: boolean;
@@ -487,7 +491,8 @@ export type Harness = {
   stubGh(options?: StubGhOptions): string;
   /**
    * Publish a release fixture on the mirror for the wrapper's own version: a
-   * real archive (system tar, upstream layout: `<root>/bin/gh`) holding the
+   * real archive (system tar, the platform's real upstream layout: versioned
+   * root on linux/macOS, flat on Windows) holding the
    * stub binary, plus the checksums file. Returns what was served and where
    * the shim is expected to cache the binary.
    */
@@ -564,17 +569,23 @@ export async function createHarness(
   ): ServedRelease => {
     const version = wrapperVersion;
     const { assetName, binaryName } = currentPlatformAsset(version);
+    // Mirror the real per-OS archive shapes: linux and macOS root everything
+    // under the versioned directory, the Windows zips are flat — unless a test
+    // explicitly overrides the root to prove the dynamic lookup.
+    const flat =
+      process.platform === "win32" && fixtureOptions.archiveRoot === undefined;
     const archiveRoot =
       fixtureOptions.archiveRoot ?? assetName.replace(/\.(tar\.gz|zip)$/, "");
     const work = mkdtempSync(join(sandbox.root, "release-fixture-"));
     const payload = join(work, "payload");
-    mkdirSync(join(payload, archiveRoot, "bin"), { recursive: true });
+    const payloadRoot = flat ? payload : join(payload, archiveRoot);
+    mkdirSync(join(payloadRoot, "bin"), { recursive: true });
     writeStubExecutable(
-      join(payload, archiveRoot, "bin", binaryName),
+      join(payloadRoot, "bin", binaryName),
       fixtureOptions.stub ?? {}
     );
     const archivePath = join(work, assetName);
-    packArchive(payload, archiveRoot, archivePath);
+    packArchive(payload, flat ? "bin" : archiveRoot, archivePath);
 
     const checksumsName = `gh_${version}_checksums.txt`;
     // Upstream shape: one `<sha256>  <asset>` line per asset, this platform's

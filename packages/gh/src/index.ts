@@ -491,9 +491,11 @@ function runTar(args: string[]): string {
 
 /**
  * Extract the binary from the release archive into `destinationDir` and return
- * its path there. The archive's versioned root directory is located by listing
- * the members — never assumed by name — and only the `bin/gh` member is
- * extracted, with the root stripped.
+ * its path there. The upstream layouts differ by OS — the linux and macOS
+ * archives root everything under the versioned directory
+ * (`gh_<version>_<os>_<arch>/bin/gh`), the Windows zips are flat
+ * (`bin/gh.exe`) — so the member is located by listing the archive, never
+ * assumed by name, and whatever sits above `bin/` is stripped.
  */
 function extractBinary(
   archivePath: string,
@@ -501,7 +503,7 @@ function extractBinary(
   binaryName: string
 ): string {
   const memberPattern = new RegExp(
-    `^[^/]+/bin/${binaryName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`
+    `^([^/]+/)?bin/${binaryName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`
   );
   const members = runTar(["-tf", archivePath])
     .split("\n")
@@ -513,13 +515,14 @@ function extractBinary(
         `'<root>/bin/${binaryName}' members, expected exactly one`
     );
   }
+  const leadingDirs = members[0].split("/").length - 2;
   runTar([
     "-xf",
     archivePath,
     "-C",
     destinationDir,
     "--strip-components",
-    "1",
+    String(leadingDirs),
     members[0],
   ]);
   return join(destinationDir, "bin", binaryName);
