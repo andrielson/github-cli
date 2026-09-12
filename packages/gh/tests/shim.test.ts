@@ -20,12 +20,14 @@ import {
 } from "./support/harness";
 
 /**
- * Every test here packs, downloads, verifies and extracts a real archive and
- * spawns real processes; on Windows the fixtures additionally carry compiled
- * standalone stub executables (~80 MB each), so multi-second tests are the
- * healthy case there — the default 5 s ceiling would cut healthy runs down.
+ * On Windows the fixtures carry compiled standalone stub executables (~80 MB
+ * each), so multi-second tests are the healthy case there — the default 5 s
+ * ceiling would cut healthy runs down. Elsewhere the fixtures are small
+ * scripts and the default ceiling keeps failure reporting fast.
  */
-setDefaultTimeout(60_000);
+if (process.platform === "win32") {
+  setDefaultTimeout(60_000);
+}
 
 /** The stub's report line: what the real binary received at the boundary. */
 function reportOf(result: SpawnResult): { args: string[]; stdin: string } {
@@ -350,19 +352,36 @@ describe("proxy support on the download path, at the process boundary (seam 1)",
   });
 
   /**
-   * The upstream authority each proxied download was sent to: the runtime's
-   * proxy dispatcher chooses the wire form — newer Node sends absolute-form
-   * requests (the full URL as the request target), Node 22 CONNECT-tunnels
-   * (the authority only). Either form is the wrapper keeping its promise
-   * that the download travelled through the proxy; what travelled is proven
-   * mirror-side.
+   * Assert that both release downloads travelled through the proxy: two
+   * proxy requests aimed at the mirror's authority — the runtime's proxy
+   * dispatcher chooses the wire form, absolute-form requests (newer Node)
+   * or CONNECT tunnels (Node 22) — and the mirror served both files, so the
+   * proxy forwarded them. A CONNECT tunnel hides the request paths by
+   * design; what travelled is proven mirror-side.
    */
-  function proxiedAuthorities(proxy: StubProxy): string[] {
-    return proxy.requests.map((request) =>
+  function expectBothDownloadsThroughProxy(
+    proxy: StubProxy,
+    release: {
+      assetUrl: string;
+      checksumsUrl: string;
+      assetPath: string;
+      checksumsPath: string;
+    }
+  ): void {
+    const authorities = proxy.requests.map((request) =>
       request.target.includes("://")
         ? new URL(request.target).host
         : request.target
     );
+    expect(authorities.sort()).toEqual(
+      [
+        new URL(release.assetUrl).host,
+        new URL(release.checksumsUrl).host,
+      ].sort()
+    );
+    expect(
+      harness.mirror.requests.map((request) => request.path).sort()
+    ).toEqual([release.assetPath, release.checksumsPath].sort());
   }
 
   /** Serve a release and point a stub proxy at the mirror, in one step. */
@@ -414,15 +433,12 @@ describe("proxy support on the download path, at the process boundary (seam 1)",
       "value with spaces",
     ]);
     expect(existsSync(cacheBinaryPath)).toBe(true);
-    // Both files travelled through the proxy — absolute-form requests or
-    // CONNECT tunnels, whichever wire form the runtime's dispatcher chose —
-    // and the proxy actually forwarded them: the mirror saw both too.
-    expect(proxiedAuthorities(proxy).sort()).toEqual(
-      [new URL(assetUrl).host, new URL(checksumsUrl).host].sort()
-    );
-    expect(
-      harness.mirror.requests.map((request) => request.path).sort()
-    ).toEqual([assetPath, checksumsPath].sort());
+    expectBothDownloadsThroughProxy(proxy, {
+      assetUrl,
+      checksumsUrl,
+      assetPath,
+      checksumsPath,
+    });
   });
 
   test("no_proxy excluding the download host bypasses the proxy entirely", async () => {
@@ -503,12 +519,12 @@ describe("proxy support on the download path, at the process boundary (seam 1)",
     const result = await harness.spawnShim(["--version"]);
 
     expect(result.exitCode).toBe(0);
-    expect(proxiedAuthorities(proxy).sort()).toEqual(
-      [new URL(assetUrl).host, new URL(checksumsUrl).host].sort()
-    );
-    expect(
-      harness.mirror.requests.map((request) => request.path).sort()
-    ).toEqual([assetPath, checksumsPath].sort());
+    expectBothDownloadsThroughProxy(proxy, {
+      assetUrl,
+      checksumsUrl,
+      assetPath,
+      checksumsPath,
+    });
     expect(existsSync(cacheBinaryPath)).toBe(true);
   });
 

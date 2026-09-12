@@ -58,6 +58,19 @@ jobs:
           bun --eval "const actual = process.platform + '/' + process.arch; console.log('runner reports ' + actual); if (actual !== '${{ matrix.expect }}') throw new Error('runner label drift: expected ${{ matrix.expect }}, got ' + actual)"
       - run: bun install --frozen-lockfile
       - run: bun test
+      # The real install-and-run for this cell: no mirror, no stubs — the
+      # shim downloads the actual upstream release the manifest names,
+      # verifies it against the real checksums and executes it on this
+      # runner's platform/architecture. bash because the same script runs on
+      # POSIX and Windows runners alike.
+      - name: Install and run the real gh on this cell
+        shell: bash
+        run: |
+          bun run build
+          version="$(node --print "require('./packages/gh/package.json').version")"
+          node packages/gh/bin/gh.js --version | tee gh-version.txt
+          # BSD grep (macOS) and git-bash grep (Windows): -F is the portable form
+          grep -F "gh version ${version}" gh-version.txt
 
   # The Alpine proof job: the same seam-1 suite under musl, plus a real
   # install-and-run of the upstream release the manifest names (no mirror, no
