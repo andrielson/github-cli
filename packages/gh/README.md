@@ -2,7 +2,7 @@
 
 `@andrielson/gh` delivers the official [GitHub CLI](https://cli.github.com) (`gh`) from npm. Installing it puts a `gh` command on your `PATH` that is a drop-in replacement for a native `gh` install — same official binary, same commands, same behavior in scripts, editors and CI.
 
-The package contains **no `gh` binary of its own**. Its `gh` command is a small shim that, on first use, downloads the official binary for the package's exact version from the [cli/cli GitHub releases](https://github.com/cli/cli/releases), verifies it against the official SHA-256 checksums (a mismatch aborts the install), stores it in a per-version cache shared by every install on the machine, and re-executes it with your arguments. Every later run is served straight from the cache with no network. The package's version always equals the upstream `gh` version it delivers: `@andrielson/gh@2.100.0` ships `gh` 2.100.0.
+The package contains **no `gh` binary of its own**. Its `gh` command is a small shim that, on first use, downloads the official binary for the package's exact version from the [cli/cli GitHub releases](https://github.com/cli/cli/releases), verifies it against the official SHA-256 checksums (a mismatch aborts the install), stores it in a per-version cache shared by every install on the machine, and re-executes it with your arguments. Every later run is served straight from the cache with no network. A failed download aborts the command cleanly — nothing is cached or executed — and the error's recovery hint names the exact command to retry: `gh install`. The package's version always equals the upstream `gh` version it delivers: `@andrielson/gh@2.100.0` ships `gh` 2.100.0.
 
 Two supply-chain properties hold throughout:
 
@@ -17,6 +17,18 @@ gh --version
 ```
 
 Arguments, stdio and exit codes pass through to the real `gh` untouched, so scripts cannot tell the shim from a native binary.
+
+## Prefetch for CI: `gh install`
+
+The first `gh` command you run pays the download. CI and scripted setups can pay it up front instead, so the first real command starts instantly and a broken network fails the pipeline at an explicit step:
+
+```sh
+npm install --global @andrielson/gh
+gh install
+gh --version
+```
+
+`gh install` is a subcommand of the shim — upstream `gh` defines no `install` command. It downloads, verifies and caches the binary for the package's exact version, then exits successfully without running the binary. It is idempotent: with the binary already cached (by an earlier command or an earlier `gh install`) it is a fast no-op that touches no network, and with `GH_BINARY` set it reports that there is nothing to install and still exits successfully, so scripts can call it unconditionally. Any failure exits non-zero with nothing cached.
 
 ## Where the binary lives: the cache
 
@@ -46,4 +58,4 @@ Set `GH_MIRROR` to a base URL and every download — the archive **and** the che
 
 ## Status
 
-Pre-release, not yet on npm. The lazy download described above is implemented and verified against the real upstream release; the `gh install` prefetch subcommand (#12), cross-platform CI validation and release automation land before the first publish.
+Pre-release, not yet on npm. The lazy download and the `gh install` prefetch described above are implemented and verified against the real upstream release; cross-platform CI validation and release automation land before the first publish.

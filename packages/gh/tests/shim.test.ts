@@ -201,4 +201,119 @@ describe("the lazy download, at the process boundary (seam 1)", () => {
     expect(result.stderr).toContain(`v${wrapperVersion}`);
     expect(result.stderr).toContain(harness.mirror.url);
   });
+
+  test("a failed download during any command aborts with a recovery hint naming gh install", async () => {
+    const result = await harness.spawnShim(["auth", "status"]);
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain(harness.mirror.url);
+    expect(result.stderr).toContain("gh install");
+  });
+});
+
+describe("the install command, at the process boundary (seam 1)", () => {
+  let harness: Harness;
+
+  beforeAll(() => {
+    buildShim();
+  });
+
+  beforeEach(async () => {
+    harness = await createHarness();
+  });
+
+  afterEach(async () => {
+    await harness.cleanup();
+  });
+
+  test("on a clean cache, downloads, verifies and populates the cache, then exits without running the binary", async () => {
+    const release = harness.serveRelease({
+      stub: { exitCode: 3, stderr: "stub: reporting on stderr" },
+    });
+    const result = await harness.spawnShim(["install"]);
+
+    expect(result.exitCode).toBe(0);
+    // The stub binary never ran: no report line on stdout, no marker on stderr.
+    expect(result.stdout).toBe("");
+    expect(result.stderr).not.toContain("stub: reporting on stderr");
+    expect(existsSync(release.cacheBinaryPath)).toBe(true);
+    expect(
+      harness.mirror.requests.map((request) => request.path).sort()
+    ).toEqual([release.assetPath, release.checksumsPath].sort());
+  });
+
+  test("re-run with a populated cache is a fast no-op: zero new mirror requests", async () => {
+    harness.serveRelease();
+    expect((await harness.spawnShim(["install"])).exitCode).toBe(0);
+    const requestsAfterPrefetch = harness.mirror.requests.length;
+
+    const result = await harness.spawnShim(["install"]);
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toBe("");
+    expect(harness.mirror.requests).toHaveLength(requestsAfterPrefetch);
+  });
+
+  test("after the lazy path already populated the cache, gh install is a no-op", async () => {
+    const release = harness.serveRelease();
+    expect((await harness.spawnShim(["--version"])).exitCode).toBe(0);
+    const requestsAfterFirstRun = harness.mirror.requests.length;
+
+    const result = await harness.spawnShim(["install"]);
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toBe("");
+    expect(harness.mirror.requests).toHaveLength(requestsAfterFirstRun);
+    expect(existsSync(release.cacheBinaryPath)).toBe(true);
+  });
+
+  test("the ADR 0001 CI pattern: prefetch, then a version check with the mirror unreachable", async () => {
+    const release = harness.serveRelease();
+    const prefetch = await harness.spawnShim(["install"]);
+    expect(prefetch.exitCode).toBe(0);
+    // The prefetch must succeed on its own, without running the binary.
+    expect(prefetch.stdout).toBe("");
+
+    await harness.mirror.stop();
+    const versionCheck = await harness.spawnShim(["--version"]);
+
+    expect(versionCheck.exitCode).toBe(0);
+    expect(reportOf(versionCheck).args).toEqual(["--version"]);
+    expect(existsSync(release.cacheBinaryPath)).toBe(true);
+  });
+
+  test("with the binary override set, gh install is a no-op: no network, nothing written", async () => {
+    const stub = harness.stubGh();
+    const before = harness.sandbox.listTree();
+    const result = await harness.spawnShim(["install"], {
+      env: { GH_BINARY: stub },
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toContain("GH_BINARY");
+    expect(result.stdout).toBe("");
+    expect(harness.mirror.requests).toHaveLength(0);
+    expect(harness.sandbox.listTree()).toEqual(before);
+  });
+
+  test("fails closed on a tampered checksum: exit 1, nothing cached, binary never runs", async () => {
+    const release = harness.serveRelease({ tamperChecksum: true });
+    const result = await harness.spawnShim(["install"]);
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("checksum");
+    expect(result.stdout).toBe("");
+    expect(existsSync(release.cacheBinaryPath)).toBe(false);
+  });
+
+  test("on an unsupported platform, fails listing manual install options without touching the network", async () => {
+    const result = await harness.spawnShim(["install"], {
+      env: { GH_PLATFORM: "sunos", GH_ARCH: "x64" },
+    });
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("sunos");
+    expect(result.stderr).toContain("https://github.com/cli/cli");
+    expect(harness.mirror.requests).toHaveLength(0);
+  });
 });

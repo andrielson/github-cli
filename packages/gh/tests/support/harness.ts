@@ -57,7 +57,10 @@ export type Mirror = {
     body: string | Uint8Array,
     headers?: Record<string, string>
   ): void;
-  /** Stop the server; resolves once the port is released. */
+  /**
+   * Stop the server; resolves once the port is released. Idempotent: a test
+   * may stop the mirror to make it unreachable before cleanup stops it again.
+   */
   stop(): Promise<void>;
 };
 
@@ -101,14 +104,10 @@ export function startMirror(): Promise<Mirror> {
           fixtures.set(path, { body: Buffer.from(body), headers });
         },
         stop() {
-          return new Promise((resolveStop, rejectStop) => {
-            server.close((error) => {
-              if (error) {
-                rejectStop(error);
-              } else {
-                resolveStop();
-              }
-            });
+          return new Promise((resolveStop) => {
+            // Closing an already-closed server reports ERR_SERVER_NOT_RUNNING;
+            // a second stop must still resolve, not reject cleanup.
+            server.close(() => resolveStop());
             server.closeAllConnections?.();
           });
         },

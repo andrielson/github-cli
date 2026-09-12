@@ -27,8 +27,19 @@ const DEFAULT_DOWNLOAD_BASE = "https://github.com/cli/cli/releases/download";
 /** The wrapper's shared cache directory name (ADR 0002). */
 const CACHE_DIR_NAME = "gh-wrapper";
 
-function fail(message: string): void {
+/** The binary override path, or undefined when unset (or empty). */
+function binaryOverride(): string | undefined {
+  const path = process.env[BINARY_OVERRIDE_ENV];
+  return path !== undefined && path !== "" ? path : undefined;
+}
+
+/** Report a shim-owned message to the user on stderr, gh-style. */
+function inform(message: string): void {
   process.stderr.write(`gh: ${message}\n`);
+}
+
+function fail(message: string): void {
+  inform(message);
   process.exitCode = 1;
 }
 
@@ -260,11 +271,8 @@ function populateCache(stagedBinary: string, finalBinary: string): void {
  * versioned archive root, and stage it into the shared per-version cache
  * atomically. Any failure leaves nothing cached and throws.
  */
-async function installIntoCache(
-  version: string,
-  target: Target,
-  platform: string
-): Promise<string> {
+async function installIntoCache(local: LocalTarget): Promise<void> {
+  const { version, target, platform, finalBinary } = local;
   const assetName = `gh_${version}_${target.assetOs}_${target.assetArch}${target.extension}`;
   const downloadBase = (
     process.env[MIRROR_OVERRIDE_ENV] ?? DEFAULT_DOWNLOAD_BASE
@@ -274,12 +282,8 @@ async function installIntoCache(
   const assetUrl = `${releaseBase}/${assetName}`;
 
   const root = cacheRoot(platform);
-  const finalBinary = cacheBinaryPath(platform, version, target.binaryName);
 
-  process.stderr.write(
-    `gh: first run: downloading the GitHub CLI ${version} from ${releaseBase} …\n`
-  );
-
+  inform(`downloading the GitHub CLI ${version} from ${releaseBase} …`);
   const checksumsText = (await download(checksumsUrl)).toString("utf8");
   const expected = expectedChecksum(checksumsText, assetName);
   if (expected === null) {
@@ -309,12 +313,102 @@ async function installIntoCache(
   } finally {
     rmSync(staging, { recursive: true, force: true });
   }
-  return finalBinary;
+}
+
+/**
+ * Everything the shim needs to find this machine's cache slot for its own
+ * version — or a report that this platform has no upstream asset at all.
+ */
+type LocalTarget = {
+  platform: string;
+  version: string;
+  target: Target;
+  finalBinary: string;
+};
+
+/**
+ * Resolve the wrapper's own version onto this machine's platform and cache
+ * slot. Null means the platform is unsupported and the failure — the
+ * manual-install message — has already been reported.
+ */
+function resolveLocalTarget(): LocalTarget | null {
+  const platform = process.env[PLATFORM_OVERRIDE_ENV] ?? process.platform;
+  const arch = process.env[ARCH_OVERRIDE_ENV] ?? process.arch;
+  const target = describeTarget(platform, arch);
+  if (target === null) {
+    fail(unsupportedPlatformMessage(platform, arch));
+    return null;
+  }
+  const version = pkg.version;
+  return {
+    platform,
+    version,
+    target,
+    finalBinary: cacheBinaryPath(platform, version, target.binaryName),
+  };
+}
+
+/**
+ * Run the lazy download, converting any failure into a clean abort whose
+ * recovery hint names the exact command to retry: every failure of the
+ * download step leaves nothing cached, and `gh install` is the idempotent
+ * retry. False means the failure has already been reported.
+ */
+async function installOrAbort(local: LocalTarget): Promise<boolean> {
+  try {
+    await installIntoCache(local);
+    return true;
+  } catch (error) {
+    fail((error as Error).message);
+    inform("to retry the download, run: gh install");
+    return false;
+  }
+}
+
+/**
+ * `gh install` — the intercepted prefetch subcommand (upstream `gh` defines
+ * no install command; ADR 0001): an explicit, idempotent request to fetch the
+ * wrapper's own version into the cache ahead of first use, for CI and scripted
+ * setups. It never re-executes the binary: a populated cache makes it a no-op,
+ * and so does the binary override, since the wrapper then manages no binary.
+ */
+async function installCommand(): Promise<void> {
+  const overridePath = binaryOverride();
+  if (overridePath !== undefined) {
+    inform(
+      `${BINARY_OVERRIDE_ENV} is set — the wrapper manages no binary of its own, so there is nothing to install`
+    );
+    return;
+  }
+
+  const local = resolveLocalTarget();
+  if (local === null) {
+    return;
+  }
+  if (existsSync(local.finalBinary)) {
+    inform(
+      `the GitHub CLI ${local.version} is already cached at ${local.finalBinary}`
+    );
+    return;
+  }
+  if (await installOrAbort(local)) {
+    inform(
+      `the GitHub CLI ${local.version} is now cached at ${local.finalBinary}`
+    );
+  }
 }
 
 async function main(): Promise<void> {
-  const overridePath = process.env[BINARY_OVERRIDE_ENV];
-  if (overridePath !== undefined && overridePath !== "") {
+  // `gh install` is intercepted before everything else — including the binary
+  // override, so CI scripts can call it unconditionally: with the override set
+  // it is a friendly no-op rather than an unknown-command error.
+  if (process.argv[2] === "install") {
+    await installCommand();
+    return;
+  }
+
+  const overridePath = binaryOverride();
+  if (overridePath !== undefined) {
     runBinary(
       overridePath,
       `the binary override ${BINARY_OVERRIDE_ENV}=${overridePath}`
@@ -322,23 +416,21 @@ async function main(): Promise<void> {
     return;
   }
 
-  const platform = process.env[PLATFORM_OVERRIDE_ENV] ?? process.platform;
-  const arch = process.env[ARCH_OVERRIDE_ENV] ?? process.arch;
-  const target = describeTarget(platform, arch);
-  if (target === null) {
-    fail(unsupportedPlatformMessage(platform, arch));
+  const local = resolveLocalTarget();
+  if (local === null) {
+    return;
+  }
+  if (existsSync(local.finalBinary)) {
+    runBinary(
+      local.finalBinary,
+      `the cached gh binary at ${local.finalBinary}`
+    );
     return;
   }
 
-  const version = pkg.version;
-  const finalBinary = cacheBinaryPath(platform, version, target.binaryName);
-  if (existsSync(finalBinary)) {
-    runBinary(finalBinary, `the cached gh binary at ${finalBinary}`);
-    return;
+  if (await installOrAbort(local)) {
+    runBinary(local.finalBinary, `the gh binary at ${local.finalBinary}`);
   }
-
-  const binary = await installIntoCache(version, target, platform);
-  runBinary(binary, `the gh binary at ${binary}`);
 }
 
 main().catch((error: unknown) => {
