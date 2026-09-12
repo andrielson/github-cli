@@ -1,0 +1,83 @@
+# CI validation matrix for the v1 target matrix (#14): the seam-1 suite runs
+# natively on all six free GitHub runners, so every platform/architecture cell
+# the wrapper claims is proven by a real run before anything publishes. The
+# suite derives its expected release asset from the runner's actual
+# process.platform/process.arch, and each job first asserts that the runner
+# really is the cell its label claims — so platform mapping is exercised for
+# real everywhere, and a runner-label drift fails loudly.
+#
+# Upstream gh linux binaries are static (built with CGO_ENABLED=0), so they run
+# on musl/Alpine unchanged; the musl job proves that for real with an
+# install-and-run of the release the wrapper's manifest names.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  seam-1:
+    name: seam-1 on ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      # One red cell must not cancel the others: every cell runs to completion
+      # and reports its own verdict, and any failure fails the workflow.
+      fail-fast: false
+      matrix:
+        # macos-26-intel is EOL around Fall 2027; the documented fallback then
+        # is running the darwin/amd64 cell on the arm64 macOS runner under
+        # Rosetta. Drop the intel cell when GitHub retires the label.
+        include:
+          - runner: ubuntu-24.04
+            expect: linux/amd64
+          - runner: ubuntu-24.04-arm
+            expect: linux/arm64
+          - runner: macos-26-intel
+            expect: darwin/amd64
+          - runner: macos-26
+            expect: darwin/arm64
+          - runner: windows-2025
+            expect: win32/amd64
+          - runner: windows-11-arm
+            expect: win32/arm64
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+      - name: Assert the runner's real platform is ${{ matrix.expect }}
+        run: >-
+          bun --eval "const actual = process.platform + '/' + process.arch; console.log('runner reports ' + actual); if (actual !== '${{ matrix.expect }}') throw new Error('runner label drift: expected ${{ matrix.expect }}, got ' + actual)"
+      - run: bun install --frozen-lockfile
+      - run: bun test
+
+  # The Alpine proof job: the same seam-1 suite under musl, plus a real
+  # install-and-run of the upstream release the manifest names (no mirror, no
+  # stubs) — proving both the wrapper on musl and the static-binary fact.
+  musl:
+    name: seam-1 and real gh on musl
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    container:
+      image: oven/bun:1-alpine
+    steps:
+      # git and node are needed before checkout: JavaScript actions run inside
+      # the container, and the suite's stub binaries carry node shebangs. GNU
+      # tar because busybox tar has no -a for the fixture archives.
+      - name: Install container tools
+        run: apk add --no-cache git nodejs tar
+      - uses: actions/checkout@v7
+      - run: bun install --frozen-lockfile
+      - run: bun test
+      - name: Install and run the real gh on musl
+        run: |
+          bun run build
+          version="$(node --print "require('./packages/gh/package.json').version")"
+          node packages/gh/bin/gh.js --version | tee gh-version.txt
+          # BusyBox grep: -F has no long form
+          grep -F "gh version ${version}" gh-version.txt

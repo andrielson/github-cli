@@ -64,4 +64,4 @@ Proxied downloads are fetch-first: on runtimes with Node's env-honouring proxy d
 
 ## Status
 
-Pre-release, not yet on npm. The lazy download, the `gh install` prefetch and the proxy support described above are implemented and verified against the real upstream release; cross-platform CI validation and release automation land before the first publish.
+Pre-release, not yet on npm. The lazy download, the `gh install` prefetch and the proxy support described above are implemented and verified against the real upstream release; cross-platform CI validation (the suite natively on all six v1 target runners, plus an Alpine/musl container job running a real install) runs on every push, and release automation lands before the first publish.
