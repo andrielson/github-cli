@@ -10,7 +10,8 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { createServer } from "node:http";
+import { createServer, request as httpRequest } from "node:http";
+import { connect as netConnect } from "node:net";
 import { tmpdir } from "node:os";
 import { join, relative, sep } from "node:path";
 import pkg from "../../package.json";
@@ -42,6 +43,102 @@ export function buildShim(): void {
 }
 
 export type MirrorRequest = { method: string; path: string };
+
+export type ProxyRequest = {
+  method: string;
+  /** The absolute request-target the client sent: the full upstream URL. */
+  target: string;
+  /** The client's User-Agent, as received by the proxy. */
+  userAgent: string;
+};
+
+export type StubProxy = {
+  /** The proxy's own URL, to be set as `http_proxy`/`https_proxy`. */
+  url: string;
+  /** Every request received so far — the proxy-used canary. */
+  requests: ProxyRequest[];
+  /** Stop the server; resolves once the port is released. */
+  stop(): Promise<void>;
+};
+
+/**
+ * A local stub HTTP proxy standing in for the user's corporate proxy: it
+ * accepts absolute-form requests (how plain-HTTP targets are proxied), records
+ * them, and forwards them to `upstreamBaseUrl`; CONNECT requests (how https
+ * targets are proxied) are recorded and tunnelled byte-for-byte to whatever
+ * host the client asked for. Downloads routed through it prove the shim
+ * honoured the proxy configuration at the process boundary.
+ */
+export function startStubProxy(upstreamBaseUrl: string): Promise<StubProxy> {
+  const requests: ProxyRequest[] = [];
+  const server = createServer((request, response) => {
+    requests.push({
+      method: request.method ?? "",
+      target: request.url ?? "",
+      userAgent: request.headers["user-agent"] ?? "",
+    });
+    let upstream: ReturnType<typeof httpRequest>;
+    try {
+      upstream = httpRequest(new URL(request.url ?? ""), {
+        method: request.method,
+      });
+    } catch (error) {
+      response.writeHead(502, { "content-type": "text/plain" });
+      response.end(`stub proxy could not parse ${request.url}: ${error}`);
+      return;
+    }
+    upstream.on("response", (upstreamResponse) => {
+      response.writeHead(
+        upstreamResponse.statusCode ?? 502,
+        upstreamResponse.headers
+      );
+      upstreamResponse.pipe(response);
+    });
+    upstream.on("error", (error) => {
+      response.writeHead(502, { "content-type": "text/plain" });
+      response.end(`stub proxy could not reach the upstream: ${error.message}`);
+    });
+    upstream.end();
+  });
+  server.on("connect", (request, socket) => {
+    requests.push({
+      method: "CONNECT",
+      target: request.url ?? "",
+      userAgent: request.headers["user-agent"] ?? "",
+    });
+    const [host, port] = (request.url ?? "").split(":");
+    const upstream = netConnect(Number(port ?? 443), host);
+    upstream.on("connect", () => {
+      socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+      socket.pipe(upstream);
+      upstream.pipe(socket);
+    });
+    upstream.on("error", () => {
+      socket.end("HTTP/1.1 502 Bad Gateway\r\n\r\n");
+    });
+    socket.on("error", () => upstream.destroy());
+  });
+  return new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      if (address === null || typeof address === "string") {
+        reject(new Error("the stub proxy could not bind an IPv4 port"));
+        return;
+      }
+      resolve({
+        url: `http://127.0.0.1:${address.port}`,
+        requests,
+        stop() {
+          return new Promise((resolveStop) => {
+            server.close(() => resolveStop());
+            server.closeAllConnections?.();
+          });
+        },
+      });
+    });
+  });
+}
 
 export type Mirror = {
   /**
@@ -135,11 +232,11 @@ export type Sandbox = {
   listTree(): string[];
 };
 
-function windowsEnv(): Record<string, string> {
+function windowsEnv(home: string): Record<string, string> {
   if (process.platform !== "win32") {
     return {};
   }
-  const env: Record<string, string> = {};
+  const env: Record<string, string> = { USERPROFILE: home };
   for (const name of ["SYSTEMROOT", "SYSTEMDRIVE", "ComSpec", "PATHEXT"]) {
     const value = process.env[name];
     if (value !== undefined) {
@@ -171,7 +268,7 @@ export function createSandbox(extraEnv: Record<string, string> = {}): Sandbox {
     TMPDIR: tmp,
     TEMP: tmp,
     TMP: tmp,
-    ...windowsEnv(),
+    ...windowsEnv(home),
     ...extraEnv,
   };
   const listTree = (): string[] => {

@@ -52,10 +52,16 @@ Set `GH_BINARY` to the path of an existing `gh` binary and the shim executes it 
 
 Set `GH_MIRROR` to a base URL and every download — the archive **and** the checksums file it is verified against — comes from `<base>/v<version>/…` instead of `https://github.com/cli/cli/releases/download/v<version>/…`. A mirror that mirrors the upstream release layout works as-is. Verification stays fail-closed against the checksums from the same mirror, which guarantees consistency with your configured source, not defense against a fully compromised one.
 
+## Proxy support
+
+Downloads honour the standard proxy environment variables — `https_proxy`/`HTTPS_PROXY` for `https://` downloads, `http_proxy`/`HTTP_PROXY` for `http://` ones, and `no_proxy`/`NO_PROXY` for host exclusions (`*` or a comma-separated list; an entry matches the host exactly or as a domain suffix, so `example.com` also covers `sub.example.com`) — plus npm's proxy configuration: `npm_config_https_proxy`/`npm_config_proxy` in the environment (how npm exposes its config to scripts) and `https-proxy`/`proxy` in your user `~/.npmrc`. The environment variables win over npm's configuration, and `no_proxy` exclusions apply to both sources.
+
+Proxied downloads are fetch-first: on runtimes with Node's env-honouring proxy dispatcher (Node ≥ 22.21) the shim re-runs itself once with that mechanism engaged (`NODE_USE_ENV_PROXY=1`), and the download travels through the proxy with the same `fetch` that serves direct downloads. Where that route cannot serve — older runtimes — the download falls back to `curl`, which honours the same variables natively. For debugging exotic proxies, `GH_DOWNLOAD=curl` forces the curl route for every download. Direct downloads with no proxy configured are untouched: a plain `fetch`, as before.
+
 ## Platform detection overrides
 
 `GH_PLATFORM` and `GH_ARCH` override the detected platform/architecture (values as Node reports them, e.g. `GH_PLATFORM=darwin GH_ARCH=arm64`). Advanced use: pre-seeding a cache for another machine. Downloading a binary that cannot execute on the current machine is on you.
 
 ## Status
 
-Pre-release, not yet on npm. The lazy download and the `gh install` prefetch described above are implemented and verified against the real upstream release; cross-platform CI validation and release automation land before the first publish.
+Pre-release, not yet on npm. The lazy download, the `gh install` prefetch and the proxy support described above are implemented and verified against the real upstream release; cross-platform CI validation and release automation land before the first publish.

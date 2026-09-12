@@ -5,6 +5,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   renameSync,
   rmSync,
   writeFileSync,
@@ -20,6 +21,15 @@ const MIRROR_OVERRIDE_ENV = "GH_MIRROR";
 /** Platform-detection overrides (advanced: pre-seeding a cache, debugging). */
 const PLATFORM_OVERRIDE_ENV = "GH_PLATFORM";
 const ARCH_OVERRIDE_ENV = "GH_ARCH";
+/** The download-mechanism override (advanced: debugging proxy corners). */
+const DOWNLOAD_OVERRIDE_ENV = "GH_DOWNLOAD";
+/**
+ * Marks the proxy-aware re-run of the shim: Node's fetch then honours the
+ * standard proxy environment variables through its global dispatcher. The
+ * mechanism only engages at process start, so the shim re-runs itself with it
+ * set when a proxied download is due.
+ */
+const ENV_PROXY_ENV = "NODE_USE_ENV_PROXY";
 
 /** Upstream release assets live under this base, one directory per version. */
 const DEFAULT_DOWNLOAD_BASE = "https://github.com/cli/cli/releases/download";
@@ -44,14 +54,17 @@ function fail(message: string): void {
 }
 
 /**
- * Execute a gh binary with the caller's arguments, wiring stdio straight
- * through, and mirror its exit. `origin` names where the binary came from, so
- * a failed spawn can point the user at the right thing to fix.
+ * Execute `command` with `args`, wiring stdio straight through, and mirror its
+ * exit. `origin` names what is being executed, so a failed spawn can point the
+ * user at the right thing to fix.
  */
-function runBinary(binaryPath: string, origin: string): void {
-  const child = spawn(binaryPath, process.argv.slice(2), {
-    stdio: "inherit",
-  });
+function runCommandLine(
+  command: string,
+  args: string[],
+  origin: string,
+  env: NodeJS.ProcessEnv = process.env
+): void {
+  const child = spawn(command, args, { stdio: "inherit", env });
   child.on("error", (error) => {
     fail(`could not execute ${origin}: ${error.message}`);
   });
@@ -68,6 +81,15 @@ function runBinary(binaryPath: string, origin: string): void {
       }
     }
   });
+}
+
+/**
+ * Execute a gh binary with the caller's arguments, wiring stdio straight
+ * through, and mirror its exit. `origin` names where the binary came from, so
+ * a failed spawn can point the user at the right thing to fix.
+ */
+function runBinary(binaryPath: string, origin: string): void {
+  runCommandLine(binaryPath, process.argv.slice(2), origin);
 }
 
 /** The platform-dependent shape of an upstream release asset. */
@@ -156,7 +178,161 @@ function cacheBinaryPath(
   return join(cacheRoot(platform), version, "bin", binaryName);
 }
 
-async function download(url: string): Promise<Buffer> {
+/**
+ * A proxy a download must travel through, and where it was configured: `env`
+ * for the standard proxy environment variables (the ones Node's env-honouring
+ * dispatcher reads), `npm` for npm's proxy configuration.
+ */
+type ResolvedProxy = {
+  url: string;
+  source: "env" | "npm";
+};
+
+/**
+ * The proxy-configured key names for a download URL, per source: the standard
+ * environment variables (`https_proxy` for https URLs, `http_proxy` for http
+ * ones, both spellings accepted), npm's environment mapping, and the npmrc
+ * file (`https-proxy`/`proxy`, npm's own precedence: https-specific first).
+ */
+function proxyKeyNames(url: URL): {
+  standardEnv: string[];
+  npmEnv: string[];
+  npmrc: string[];
+} {
+  if (url.protocol === "https:") {
+    return {
+      standardEnv: ["https_proxy", "HTTPS_PROXY"],
+      npmEnv: ["npm_config_https_proxy", "npm_config_proxy"],
+      npmrc: ["https-proxy", "proxy"],
+    };
+  }
+  return {
+    standardEnv: ["http_proxy", "HTTP_PROXY"],
+    npmEnv: ["npm_config_proxy"],
+    npmrc: ["proxy"],
+  };
+}
+
+/** The first defined, non-empty value among the environment `names`. */
+function firstEnvValue(...names: string[]): string | null {
+  for (const name of names) {
+    const value = process.env[name];
+    if (value !== undefined && value !== "") {
+      return value;
+    }
+  }
+  return null;
+}
+
+/**
+ * Whether `host` is excluded from proxying by the `no_proxy` variable,
+ * curl-style: `*` excludes everything; an entry matches the host exactly or
+ * as a dot-boundary suffix (`example.com` covers `sub.example.com`).
+ */
+function noProxyMatches(host: string): boolean {
+  const list = firstEnvValue("no_proxy", "NO_PROXY");
+  if (list === null) {
+    return false;
+  }
+  for (const rawEntry of list.split(",")) {
+    const entry = rawEntry.trim().replace(/^\./, "");
+    if (
+      entry === "*" ||
+      (entry !== "" && (host === entry || host.endsWith(`.${entry}`)))
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * The user's npmrc as key/value pairs, or an empty map when there is none to
+ * read. Flat INI shape: `key = value` lines, `#`/`;` comments, optional
+ * surrounding quotes; `false`/`null` values count as unset (how npm spells a
+ * disabled proxy).
+ */
+function readUserNpmrc(): Map<string, string> {
+  const config = new Map<string, string>();
+  const path = process.env.NPM_CONFIG_USERCONFIG ?? join(homedir(), ".npmrc");
+  let text: string;
+  try {
+    text = readFileSync(path, "utf8");
+  } catch {
+    return config;
+  }
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (trimmed === "" || trimmed.startsWith("#") || trimmed.startsWith(";")) {
+      continue;
+    }
+    const separator = trimmed.indexOf("=");
+    if (separator < 1) {
+      continue;
+    }
+    const key = trimmed.slice(0, separator).trim();
+    let value = trimmed.slice(separator + 1).trim();
+    if (
+      value.length >= 2 &&
+      ((value.startsWith('"') && value.endsWith('"')) ||
+        (value.startsWith("'") && value.endsWith("'")))
+    ) {
+      value = value.slice(1, -1);
+    }
+    if (value !== "" && value !== "false" && value !== "null") {
+      config.set(key, value);
+    }
+  }
+  return config;
+}
+
+/**
+ * The proxy npm would use for `url`: npm-mapped environment configuration
+ * first (how npm exposes its config to scripts), then the user's npmrc. Null
+ * when npm configures no proxy.
+ */
+function npmConfigProxy(url: URL): string | null {
+  const { npmEnv, npmrc: npmrcKeys } = proxyKeyNames(url);
+  const fromEnv = firstEnvValue(...npmEnv);
+  if (fromEnv !== null) {
+    return fromEnv;
+  }
+  const npmrc = readUserNpmrc();
+  for (const key of npmrcKeys) {
+    const value = npmrc.get(key);
+    if (value !== undefined) {
+      return value;
+    }
+  }
+  return null;
+}
+
+/**
+ * The proxy a download of `url` must travel through, or null for a direct
+ * download: the standard environment variables first, then npm's proxy
+ * configuration, with `no_proxy` exclusions applied before either source is
+ * consulted.
+ */
+function proxyForUrl(url: URL): ResolvedProxy | null {
+  if (noProxyMatches(url.hostname)) {
+    return null;
+  }
+  const fromEnv = firstEnvValue(...proxyKeyNames(url).standardEnv);
+  if (fromEnv !== null) {
+    return { url: fromEnv, source: "env" };
+  }
+  const fromNpm = npmConfigProxy(url);
+  if (fromNpm !== null) {
+    return { url: fromNpm, source: "npm" };
+  }
+  return null;
+}
+
+/**
+ * Download `url` with Node's fetch — the direct route, and the proxied route
+ * whenever the env-honouring global dispatcher is live for this process.
+ */
+async function fetchDownload(url: string): Promise<Buffer> {
   let response: Response;
   try {
     response = await fetch(url);
@@ -167,6 +343,92 @@ async function download(url: string): Promise<Buffer> {
     throw new Error(`downloading ${url} failed: HTTP ${response.status}`);
   }
   return Buffer.from(await response.arrayBuffer());
+}
+
+/**
+ * Download `url` with curl — the non-fetch fallback for the runtimes and
+ * proxy corner cases the env-honouring fetch route cannot serve. The proxy is
+ * passed explicitly, so npm-configured proxies reach curl too.
+ */
+function curlDownload(url: string, proxyUrl: string | null): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const args = ["--fail", "--silent", "--show-error", "--location"];
+    if (proxyUrl !== null) {
+      args.push("--proxy", proxyUrl);
+    }
+    args.push(url);
+    const child = spawn("curl", args, {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const chunks: Buffer[] = [];
+    let failureDetail = "";
+    child.stdout.on("data", (chunk: Buffer) => {
+      chunks.push(chunk);
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      failureDetail += chunk.toString("utf8");
+    });
+    child.on("error", (error) => {
+      reject(new Error(`could not run curl to fetch ${url}: ${error.message}`));
+    });
+    child.on("close", (code) => {
+      if (code === 0) {
+        resolve(Buffer.concat(chunks));
+      } else {
+        reject(new Error(`downloading ${url} failed: ${failureDetail.trim()}`));
+      }
+    });
+  });
+}
+
+/** Whether the user forced the curl route with the download-mechanism override. */
+function curlForced(): boolean {
+  return process.env[DOWNLOAD_OVERRIDE_ENV] === "curl";
+}
+
+/** Whether this process already runs with Node's env-honouring fetch dispatcher live. */
+function envProxyRunActive(): boolean {
+  return process.env[ENV_PROXY_ENV] === "1";
+}
+
+/** Whether this Node understands NODE_USE_ENV_PROXY (added in v22.21; every release from v24 on has it). */
+function nodeSupportsEnvProxy(): boolean {
+  const match = /^v(\d+)\.(\d+)/.exec(process.version);
+  if (match === null) {
+    return false;
+  }
+  const major = Number(match[1]);
+  return major >= 24 || (major === 22 && Number(match[2]) >= 21);
+}
+
+/**
+ * Whether `proxy` cannot be served by plain fetch in this process: an active
+ * env-proxy run honours only the standard environment variables, so an
+ * npm-configured proxy needs curl; without an active run, supporting runtimes
+ * have already been delegated to the proxy-aware re-run, so what is left is a
+ * runtime without the mechanism.
+ */
+function curlRequired(proxy: ResolvedProxy): boolean {
+  if (envProxyRunActive()) {
+    return proxy.source !== "env";
+  }
+  return !nodeSupportsEnvProxy();
+}
+
+/**
+ * Download `url`, honouring the resolved proxy configuration: direct
+ * downloads stay a plain fetch; proxied downloads go through the env-honouring
+ * global dispatcher when that route is live, and through curl otherwise.
+ */
+async function download(url: string): Promise<Buffer> {
+  const proxy = proxyForUrl(new URL(url));
+  if (curlForced()) {
+    return curlDownload(url, proxy?.url ?? null);
+  }
+  if (proxy === null || !curlRequired(proxy)) {
+    return fetchDownload(url);
+  }
+  return curlDownload(url, proxy.url);
 }
 
 function sha256(data: Buffer): string {
@@ -265,6 +527,33 @@ function populateCache(stagedBinary: string, finalBinary: string): void {
   }
 }
 
+/** Where the wrapper's own release lives on the configured download base. */
+type ReleaseUrls = {
+  /** The upstream asset name, e.g. `gh_2.100.0_linux_amd64.tar.gz`. */
+  assetName: string;
+  checksumsUrl: string;
+  assetUrl: string;
+};
+
+/**
+ * The URLs and asset name of the wrapper's own release on the configured
+ * download base: `<base>/v<version>/…`, upstream by default, the mirror
+ * override when set.
+ */
+function releaseAssetUrls(local: LocalTarget): ReleaseUrls {
+  const { version, target } = local;
+  const assetName = `gh_${version}_${target.assetOs}_${target.assetArch}${target.extension}`;
+  const downloadBase = (
+    process.env[MIRROR_OVERRIDE_ENV] ?? DEFAULT_DOWNLOAD_BASE
+  ).replace(/\/+$/, "");
+  const releaseBase = `${downloadBase}/v${version}`;
+  return {
+    assetName,
+    checksumsUrl: `${releaseBase}/gh_${version}_checksums.txt`,
+    assetUrl: `${releaseBase}/${assetName}`,
+  };
+}
+
 /**
  * The lazy download (ADR 0001): fetch the archive and the checksums file for
  * the wrapper's own version, verify fail-closed, extract the binary from the
@@ -272,18 +561,13 @@ function populateCache(stagedBinary: string, finalBinary: string): void {
  * atomically. Any failure leaves nothing cached and throws.
  */
 async function installIntoCache(local: LocalTarget): Promise<void> {
-  const { version, target, platform, finalBinary } = local;
-  const assetName = `gh_${version}_${target.assetOs}_${target.assetArch}${target.extension}`;
-  const downloadBase = (
-    process.env[MIRROR_OVERRIDE_ENV] ?? DEFAULT_DOWNLOAD_BASE
-  ).replace(/\/+$/, "");
-  const releaseBase = `${downloadBase}/v${version}`;
-  const checksumsUrl = `${releaseBase}/gh_${version}_checksums.txt`;
-  const assetUrl = `${releaseBase}/${assetName}`;
-
+  const { platform, version, target, finalBinary } = local;
+  const { assetName, checksumsUrl, assetUrl } = releaseAssetUrls(local);
   const root = cacheRoot(platform);
 
-  inform(`downloading the GitHub CLI ${version} from ${releaseBase} …`);
+  inform(
+    `downloading the GitHub CLI ${version} from ${dirname(checksumsUrl)} …`
+  );
   const checksumsText = (await download(checksumsUrl)).toString("utf8");
   const expected = expectedChecksum(checksumsText, assetName);
   if (expected === null) {
@@ -366,6 +650,38 @@ async function installOrAbort(local: LocalTarget): Promise<boolean> {
 }
 
 /**
+ * The proxy-aware re-run gate: when a proxied download is due on a runtime
+ * that supports Node's env-honouring proxy dispatcher, delegate the whole run
+ * to a fresh copy of this shim started with NODE_USE_ENV_PROXY=1 — the
+ * mechanism engages only at process start. An npm-configured proxy is
+ * injected as the matching standard variable so the dispatcher sees it.
+ * True means the run was delegated and the caller has nothing left to do.
+ */
+function delegateToEnvProxyRun(local: LocalTarget): boolean {
+  const url = new URL(releaseAssetUrls(local).checksumsUrl);
+  const proxy = proxyForUrl(url);
+  if (
+    proxy === null ||
+    curlForced() ||
+    envProxyRunActive() ||
+    !nodeSupportsEnvProxy()
+  ) {
+    return false;
+  }
+  const env: NodeJS.ProcessEnv = { ...process.env, [ENV_PROXY_ENV]: "1" };
+  if (proxy.source === "npm") {
+    env[proxyKeyNames(url).standardEnv[0]] = proxy.url;
+  }
+  runCommandLine(
+    process.execPath,
+    [process.argv[1], ...process.argv.slice(2)],
+    "the proxy-aware re-run of the shim",
+    env
+  );
+  return true;
+}
+
+/**
  * `gh install` — the intercepted prefetch subcommand (upstream `gh` defines
  * no install command; ADR 0001): an explicit, idempotent request to fetch the
  * wrapper's own version into the cache ahead of first use, for CI and scripted
@@ -389,6 +705,9 @@ async function installCommand(): Promise<void> {
     inform(
       `the GitHub CLI ${local.version} is already cached at ${local.finalBinary}`
     );
+    return;
+  }
+  if (delegateToEnvProxyRun(local)) {
     return;
   }
   if (await installOrAbort(local)) {
@@ -425,6 +744,10 @@ async function main(): Promise<void> {
       local.finalBinary,
       `the cached gh binary at ${local.finalBinary}`
     );
+    return;
+  }
+
+  if (delegateToEnvProxyRun(local)) {
     return;
   }
 

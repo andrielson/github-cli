@@ -6,14 +6,16 @@ import {
   expect,
   test,
 } from "bun:test";
-import { existsSync } from "node:fs";
+import { existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   buildShim,
   createHarness,
+  startStubProxy,
   wrapperVersion,
   type Harness,
   type SpawnResult,
+  type StubProxy,
 } from "./support/harness";
 
 /** The stub's report line: what the real binary received at the boundary. */
@@ -315,5 +317,186 @@ describe("the install command, at the process boundary (seam 1)", () => {
     expect(result.stderr).toContain("sunos");
     expect(result.stderr).toContain("https://github.com/cli/cli");
     expect(harness.mirror.requests).toHaveLength(0);
+  });
+});
+
+describe("proxy support on the download path, at the process boundary (seam 1)", () => {
+  let harness: Harness;
+  const proxies: StubProxy[] = [];
+
+  beforeAll(() => {
+    buildShim();
+  });
+
+  beforeEach(async () => {
+    harness = await createHarness();
+  });
+
+  afterEach(async () => {
+    await harness.cleanup();
+    for (const proxy of proxies) {
+      await proxy.stop();
+    }
+    proxies.length = 0;
+  });
+
+  /** Serve a release and point a stub proxy at the mirror, in one step. */
+  async function serveReleaseBehindProxy(
+    stub: { exitCode?: number; stderr?: string } = {}
+  ): Promise<{
+    proxy: StubProxy;
+    assetUrl: string;
+    checksumsUrl: string;
+    assetPath: string;
+    checksumsPath: string;
+    cacheBinaryPath: string;
+  }> {
+    const release = harness.serveRelease({ stub });
+    const proxy = await startStubProxy(harness.mirror.url);
+    proxies.push(proxy);
+    return {
+      proxy,
+      assetUrl: `${harness.mirror.url}${release.assetPath}`,
+      checksumsUrl: `${harness.mirror.url}${release.checksumsPath}`,
+      assetPath: release.assetPath,
+      checksumsPath: release.checksumsPath,
+      cacheBinaryPath: release.cacheBinaryPath,
+    };
+  }
+
+  test("a configured proxy routes both release downloads through it and the run still succeeds", async () => {
+    const {
+      proxy,
+      assetUrl,
+      checksumsUrl,
+      assetPath,
+      checksumsPath,
+      cacheBinaryPath,
+    } = await serveReleaseBehindProxy({
+      exitCode: 3,
+      stderr: "stub: reporting on stderr",
+    });
+    const result = await harness.spawnShim(
+      ["--version", "--flag", "value with spaces"],
+      { env: { http_proxy: proxy.url } }
+    );
+
+    expect(result.exitCode).toBe(3);
+    expect(result.stderr).toContain("stub: reporting on stderr");
+    expect(reportOf(result).args).toEqual([
+      "--version",
+      "--flag",
+      "value with spaces",
+    ]);
+    expect(existsSync(cacheBinaryPath)).toBe(true);
+    // Both files travelled through the proxy (absolute targets), and the
+    // proxy actually forwarded them — the mirror saw both too.
+    expect(proxy.requests.map((request) => request.target).sort()).toEqual(
+      [assetUrl, checksumsUrl].sort()
+    );
+    expect(
+      harness.mirror.requests.map((request) => request.path).sort()
+    ).toEqual([assetPath, checksumsPath].sort());
+  });
+
+  test("no_proxy excluding the download host bypasses the proxy entirely", async () => {
+    const { proxy, assetPath, checksumsPath, cacheBinaryPath } =
+      await serveReleaseBehindProxy();
+    const result = await harness.spawnShim(["--version"], {
+      env: { http_proxy: proxy.url, no_proxy: "127.0.0.1" },
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(proxy.requests).toHaveLength(0);
+    expect(
+      harness.mirror.requests.map((request) => request.path).sort()
+    ).toEqual([assetPath, checksumsPath].sort());
+    expect(existsSync(cacheBinaryPath)).toBe(true);
+  });
+
+  test("no_proxy excluding the download host also bypasses an npm-configured proxy", async () => {
+    const { proxy, assetPath, checksumsPath } = await serveReleaseBehindProxy();
+    writeFileSync(join(harness.sandbox.home, ".npmrc"), `proxy=${proxy.url}\n`);
+    const result = await harness.spawnShim(["--version"], {
+      env: { no_proxy: "127.0.0.1" },
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(proxy.requests).toHaveLength(0);
+    expect(
+      harness.mirror.requests.map((request) => request.path).sort()
+    ).toEqual([assetPath, checksumsPath].sort());
+  });
+
+  test("no_proxy naming an unrelated host does not bypass the proxy", async () => {
+    const { proxy } = await serveReleaseBehindProxy();
+    const result = await harness.spawnShim(["--version"], {
+      env: { http_proxy: proxy.url, no_proxy: "example.com" },
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(proxy.requests).toHaveLength(2);
+  });
+
+  test("https_proxy does not capture plain-http downloads: protocol-specific matching", async () => {
+    const { proxy, assetPath, checksumsPath } = await serveReleaseBehindProxy();
+    const result = await harness.spawnShim(["--version"], {
+      env: { https_proxy: proxy.url },
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(proxy.requests).toHaveLength(0);
+    expect(
+      harness.mirror.requests.map((request) => request.path).sort()
+    ).toEqual([assetPath, checksumsPath].sort());
+  });
+
+  test("GH_DOWNLOAD=curl forces the curl fallback: the proxy serves a curl client", async () => {
+    const { proxy } = await serveReleaseBehindProxy();
+    const result = await harness.spawnShim(["--version"], {
+      env: { http_proxy: proxy.url, GH_DOWNLOAD: "curl" },
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(proxy.requests).toHaveLength(2);
+    for (const request of proxy.requests) {
+      expect(request.userAgent).toContain("curl");
+    }
+  });
+
+  test("npm's proxy configuration in ~/.npmrc routes downloads through the proxy", async () => {
+    const { proxy, assetUrl, checksumsUrl, cacheBinaryPath } =
+      await serveReleaseBehindProxy();
+    writeFileSync(join(harness.sandbox.home, ".npmrc"), `proxy=${proxy.url}\n`);
+    const result = await harness.spawnShim(["--version"]);
+
+    expect(result.exitCode).toBe(0);
+    expect(proxy.requests.map((request) => request.target).sort()).toEqual(
+      [assetUrl, checksumsUrl].sort()
+    );
+    expect(existsSync(cacheBinaryPath)).toBe(true);
+  });
+
+  test("npm_config_proxy in the environment (npm script context) routes downloads through the proxy", async () => {
+    const { proxy } = await serveReleaseBehindProxy();
+    const result = await harness.spawnShim(["--version"], {
+      env: { npm_config_proxy: proxy.url },
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(proxy.requests).toHaveLength(2);
+  });
+
+  test("an npm-configured proxy under an already-active env-proxy run is served by the curl fallback", async () => {
+    const { proxy } = await serveReleaseBehindProxy();
+    const result = await harness.spawnShim(["--version"], {
+      env: { NODE_USE_ENV_PROXY: "1", npm_config_proxy: proxy.url },
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(proxy.requests).toHaveLength(2);
+    for (const request of proxy.requests) {
+      expect(request.userAgent).toContain("curl");
+    }
   });
 });
