@@ -1,0 +1,120 @@
+# Publishes a tagged release commit to npm via OIDC trusted publishing (#15).
+#
+# ADR 0004: every publish comes from the release commit tagged v<version>,
+# whose package.json equals the version being published — so this workflow
+# refuses to publish anything it cannot check out as v<version> with a
+# matching manifest. It performs no version computation; the caller decides
+# what to publish (the bootstrap re-publish and the future poll dispatch it
+# with dist-tag latest; the backfill workflow calls it with dist-tag
+# backfill) and supplies the version.
+#
+# Trusted publishing constraints (issue #3, npm docs): npm >= 11.5.1,
+# Node >= 22.14, id-token: write, GitHub-hosted runners, repository.url
+# exact match — and no npm token anywhere. OIDC authenticates the publish
+# and provenance attestations are generated automatically; no --provenance
+# flag, no NODE_AUTH_TOKEN.
+
+name: Publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish, from its v<version> tag"
+        required: true
+        type: string
+      dist-tag:
+        description: "dist-tag to publish under"
+        required: false
+        default: latest
+        type: string
+  workflow_call:
+    inputs:
+      version:
+        description: "Version to publish, from its v<version> tag"
+        required: true
+        type: string
+      dist-tag:
+        description: "dist-tag to publish under"
+        required: false
+        default: latest
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+# The spec's single serialization point: every publish path (this workflow,
+# the backfill, the poll) shares this group so no two publishes can race.
+concurrency:
+  group: npm-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      VERSION: ${{ inputs.version }}
+      DIST_TAG: ${{ inputs.dist-tag }}
+    steps:
+      # ADR 0004: the publish source of truth is the tag, not the branch.
+      - uses: actions/checkout@v7
+        with:
+          ref: v${{ inputs.version }}
+      - uses: actions/setup-node@v7
+        with:
+          # No registry-url: the default registry is npmjs.org, and leaving
+          # .npmrc absent keeps the tokenless OIDC path unshadowed.
+          node-version: 22
+      - name: Assert the tag's manifest version matches the request
+        run: >-
+          node --eval "const version = require('./packages/gh/package.json').version;
+          if (version !== process.env.VERSION) { throw new Error('tag v' + process.env.VERSION + ' carries manifest version ' + version + '; refusing to publish') }"
+      - name: Assert Node >= 22.14 (trusted publishing floor)
+        run: >-
+          node --eval "const [major, minor] = process.versions.node.split('.').map(Number);
+          if (major < 22 || (major === 22 && minor < 14)) { throw new Error('Node ' + process.versions.node + ' is below the 22.14 trusted-publishing floor') }"
+      - name: Bring npm to >= 11.5.1 (trusted publishing support)
+        run: |
+          npm install --global npm@latest
+          actual="$(npm --version)"
+          printf 'npm %s\n' "$actual"
+          oldest="$(printf '%s\n11.5.1\n' "$actual" | sort --version-sort | head --lines=1)"
+          if [[ "$oldest" != "11.5.1" ]]; then
+            printf '::error::npm %s is older than 11.5.1 (trusted publishing floor)\n' "$actual"
+            exit 1
+          fi
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bun run build
+      - name: Show the exact tarball that will ship
+        working-directory: packages/gh
+        run: npm pack --dry-run
+      - name: npm publish
+        working-directory: packages/gh
+        run: npm publish --access public --tag "$DIST_TAG"
+      - name: Verify the published state
+        run: |
+          published=""
+          for attempt in 1 2 3; do
+            published="$(npm view "@andrielson/gh@$VERSION" version 2>/dev/null || true)"
+            if [[ "$published" == "$VERSION" ]]; then
+              break
+            fi
+            printf 'registry not showing %s yet (attempt %s of 3); waiting 10s\n' "$VERSION" "$attempt"
+            sleep 10
+          done
+          if [[ "$published" != "$VERSION" ]]; then
+            printf '::error::registry does not report @andrielson/gh@%s as published\n' "$VERSION"
+            exit 1
+          fi
+          if [[ "$DIST_TAG" == "latest" ]]; then
+            latest="$(npm view @andrielson/gh dist-tags.latest)"
+            if [[ "$latest" != "$VERSION" ]]; then
+              printf '::error::dist-tag latest is %s, expected %s\n' "$latest" "$VERSION"
+              exit 1
+            fi
+          fi
+          npm view "@andrielson/gh@$VERSION" attestations --json || true
